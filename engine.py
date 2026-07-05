@@ -1276,6 +1276,14 @@ def _c_collection(args):
         cfg.update({"configured": True, "enabled": True, "min_rarity": r})
         _save_collection_cfg(cfg)
         return "🏺 收藏缸方案：自定义，门槛设为「%s」及以上。" % RARITY[r]["label"]
+    if sub in ("saved", "done", "clear", "入缸完成", "已入缸"):
+        pending = S.setdefault("pending_collection", [])
+        if not pending:
+            return "🏺 当前没有待确认入缸的收藏任务。"
+        n = len(pending)
+        S["pending_collection"] = []
+        _save()
+        return "✅ 已确认 %d 条鱼缸收藏记录完成，收藏门禁已解除。现在可以继续推进游戏。" % n
     # status
     if not cfg.get("configured"):
         return ("🏺 收藏缸还没设置过。可选：\n"
@@ -1296,7 +1304,9 @@ def _new_state(seed=_DEFAULT_SEED):
             "encyclopedia": {}, "stats": {"total_casts": 0, "total_caught": 0, "total_chests": 0, "total_dives": 0}, "local_dry": 0,
             "fever": 0, "free_bait": 0,    # 幸运事件挂的 buff：剩余翻倍竿数 / 剩余免饵竿数
             "oxygen": 0, "oxygen_ever": False,   # 潜水：氧气瓶库存 / 是否买过氧气瓶（买过才显示水下待发现）
-            "dive_unlocked": [], "map_fragments": {}}   # 已解锁潜水的地点 / 各地点已集藏宝图碎片数
+            "dive_unlocked": [], "map_fragments": {},   # 已解锁潜水的地点 / 各地点已集藏宝图碎片数
+            "pending_collection": [],   # 待确认入缸的稀有鱼记录；未清空前禁止继续推进游戏
+            "handshake": _default_handshake_state()}
 
 S = None
 def _load():
@@ -1330,6 +1340,8 @@ def _load():
     S.setdefault("stats", {}).setdefault("total_chests", 0)
     S["stats"].setdefault("total_casts", 0); S["stats"].setdefault("total_caught", 0); S["stats"].setdefault("total_dives", 0)
     S.setdefault("last_export_turn", 0)   # 上次导出到外部存储（如 Drive）时的回合数，供 cmd() 判断是否该提醒导出
+    S.setdefault("pending_collection", [])
+    _normalize_handshake()
     return S
 def _save():
     global _IO_WARN
@@ -1490,6 +1502,266 @@ def _sloc(): return LOCATIONS[S["location_id"]]["name"] + " · " + SEASONS[S["se
 def _footer(): return "点数 %d ｜ %s ｜ 回合 %d ｜ 图鉴 %d/%d" % (S["points"], _sloc(), S["turn"], len(S["encyclopedia"]), len(FISH))
 
 # 紧凑状态栏：每次 cmd() 末尾附一行机读 JSON，省得 AI 再 call status（也省 token）。关键信息为主，不堆杂项。
+
+# ── First Play Onboarding / 首次陪玩引导 ──
+# 目的：把 README 里的陪玩规则从“建议”升级为游戏状态机门禁。
+# 未完成握手前，任何会推进游戏进度/消耗资源/改变地点的指令都应被拦截。
+_HANDSHAKE_ALLOWED = {
+    "", "help", "h", "?", "status", "s", "start", "checkin", "check-in", "开局", "接入",
+    "collection", "shop", "inventory", "inv", "i", "encyclopedia", "enc", "e", "look", "l",
+    "savecopy", "export", "backup", "__exported__", "exported", "mark_exported", "handshake"
+}
+_HANDSHAKE_PROGRESS_CMDS = {
+    "buy", "cast", "c", "dive", "open", "goto", "go", "sell",
+    "choose", "ch", "surface", "up"
+}
+_HANDSHAKE_DEFAULTS = {
+    "collection_mode": "rare_plus_aquarium",
+    "aquarium_save": "folder_then_record",
+    "visual_mode": "web",
+}
+
+def _default_handshake_state():
+    return {
+        "completed": False,
+        "collection_mode": "",
+        "aquarium_save": "",
+        "visual_mode": "",
+        "confirmed_at_turn": None,
+    }
+
+def _normalize_handshake():
+    hs = S.setdefault("handshake", _default_handshake_state())
+    d = _default_handshake_state()
+    d.update(hs if isinstance(hs, dict) else {})
+    S["handshake"] = d
+    return d
+
+def _handshake_done():
+    return bool(_normalize_handshake().get("completed"))
+
+def _handshake_blocked_message(cmd_name):
+    return (
+        "⛔ 首次陪玩引导未完成，已拦截指令：%s\n"
+        "\n"
+        "在完成首次陪玩引导前，禁止 cast / dive / buy / goto / sell / open，"
+        "以及任何会消耗资源、改变地点或推进进度的动作。\n"
+        "\n"
+        "这一步不是设置页，而是第一段陪玩体验。流程：\n"
+        "1. cmd('status')\n"
+        "2. cmd('collection status')\n"
+        "3. 判断当前环境是否能直接提供网图\n"
+        "4. 使用 cmd('handshake template') 返回的自然开场文案，填入状态字段\n"
+        "5. 等玩家说『按默认来』或用自然语言说想改哪一项\n"
+        "6. 生成本次 play_settings，再执行 handshake defaults 或 handshake set\n"
+        "\n"
+        "如果能直接提供网图，玩家说『按默认来』后可执行：cmd('handshake defaults')。\n"
+        "可用：handshake status / handshake template / handshake defaults / handshake set collection=rare_plus_aquarium aquarium=folder_then_record visual=keywords / handshake reset"
+        "\n"
+        "不要把开局变成空白表单，例如只问：\n"
+        "收藏模式：\n"
+        "入缸方式：\n"
+        "视觉模式：\n"
+        "\n"
+        "这算 incomplete onboarding / failed gameplay。"
+        % cmd_name
+    )
+
+def _handshake_label(key, value):
+    labels = {
+        "collection_mode": {
+            "default": "稀有及以上提醒收藏",
+            "default_card": "稀有及以上提醒收藏，并生成可复制鱼缸记录",
+            "rare_plus_aquarium": "稀有及以上自动进入鱼缸流程",
+            "light": "只在战报里标记，不生成鱼缸记录",
+            "card": "达到门槛时生成可复制鱼缸记录",
+            "file": "达到门槛时优先写入鱼缸文件夹",
+            "custom": "自定义收藏规则",
+        },
+        "aquarium_save": {
+            "report": "只在战报里写建议收藏",
+            "card": "仅生成可复制鱼缸记录",
+            "file": "写入固定鱼缸文件夹",
+            "folder_then_record": "优先写入「我的鱼缸」文件夹；失败则生成可复制鱼缸记录",
+            "ask": "每次都先询问玩家",
+        },
+        "visual_mode": {
+            "web": "优先现实 / 气质网图参考",
+            "keywords": "只给搜索关键词",
+            "generate": "生成一张氛围图作为兜底",
+            "text": "纯文字描述，不配图",
+        },
+    }
+    return labels.get(key, {}).get(value, value or "未确认")
+
+def _handshake_status_text():
+    hs = _normalize_handshake()
+    if not hs.get("completed"):
+        return (
+            "🤝 首次陪玩引导：未完成。\n"
+            "允许先看 help/status/collection status/start/handshake template；禁止推进游戏。\n"
+            "- 稀有鱼收藏：稀有及以上自动进入鱼缸流程；能写文件就保存到「我的鱼缸」；写入失败时给可复制鱼缸记录\n"
+            "- 画面参考：优先现实 / 气质网图参考\n"
+        )
+    return (
+        "🤝 首次陪玩引导：已完成。\n"
+        "play_settings:\n"
+        "- collection_mode：%s\n"
+        "- aquarium_save：%s\n"
+        "- visual_mode：%s\n"
+        "- report_style：story + status + next recommendation"
+        % (
+            _handshake_label("collection_mode", hs.get("collection_mode")),
+            _handshake_label("aquarium_save", hs.get("aquarium_save")),
+            _handshake_label("visual_mode", hs.get("visual_mode")),
+        )
+    )
+
+def _handshake_opening_template():
+    return (
+        "【首次陪玩引导文案 / Required First Play Opening Script】\n"
+        "After reading status and collection status, fill only the bracketed fields. "
+        "Do not turn this into a blank settings form. The player can say 按默认来 or naturally say what they want to change.\n"
+        "\n"
+        "我先不急着开钓。这个二改版不是单纯跑钓鱼命令，而是带收藏、鱼缸和画面感的陪玩版。\n"
+        "\n"
+        "我已经读取到当前状态：\n"
+        "- 地点：[current_location]\n"
+        "- 季节：[current_season]\n"
+        "- 点数：[points]\n"
+        "- 鱼饵：[bait_stock]\n"
+        "- 氧气：[oxygen_stock_or_not_available]\n"
+        "- 图鉴：[collection_progress]\n"
+        "- 收藏缸：[aquarium_status]\n"
+        "\n"
+        "开始前我先确认一下默认陪玩方式：\n"
+        "\n"
+        "1. 稀有鱼收藏\n"
+        "钓到稀有及以上的鱼时，我会提醒你收藏，并优先保存进当前游戏目录下的「我的鱼缸」。\n"
+        "如果文件写入失败，我会生成一条可复制的「鱼缸记录」，让你手动保存。\n"
+        "\n"
+        "2. 画面参考\n"
+        "遇到新鱼、新钓点、潜水、漂流瓶、宝箱、藏宝图、换季等事件时，我会尽量配现实 / 气质网图参考。\n"
+        "[visual_capability_note]\n"
+        "\n"
+        "你可以直接回复“按默认来”，我就按这个方式开始。\n"
+        "也可以说你想改哪一项，比如：收藏想轻一点、只记录传说鱼、指定鱼缸文件夹、不想配图、只要搜索关键词，或想用氛围图。\n"
+        "\n"
+        "确认后我会生成本次陪玩配置档，然后再开始钓鱼。\n"
+        "\n"
+        "视觉能力边界：\n"
+        "- 如果能直接提供网图，[visual_capability_note] = 默认我会优先给现实 / 气质网图参考。\n"
+        "- 如果不能直接提供网图但能生图，必须说：我当前不能直接发网图，所以默认改为搜索关键词；如果你想要，我也可以生成氛围图。\n"
+        "- 如果既不能发网图也不能生图，必须说：我当前不能直接发网图，也不能生成图片，所以默认改为文字描述 + 搜索关键词。\n"
+        "- 不要只问 收藏模式/入缸方式/视觉模式。那不是合格 onboarding。"
+    )
+
+def _c_handshake(args):
+    hs = _normalize_handshake()
+    sub = (args[0].lower() if args else "status")
+    if sub in ("status", "s"):
+        return _handshake_status_text()
+    if sub in ("template", "opening", "open"):
+        return _handshake_opening_template()
+    if sub in ("reset", "clear"):
+        S["handshake"] = _default_handshake_state()
+        return "🤝 首次陪玩引导已重置。下一次推进游戏前必须重新确认。"
+    if sub in ("defaults", "default", "按默认来", "默认"):
+        hs.update(_HANDSHAKE_DEFAULTS)
+        hs["completed"] = True
+        hs["confirmed_at_turn"] = S.get("turn", 0)
+        S["handshake"] = hs
+        return (
+            "本次陪玩配置档已生成：\n"
+            "play_settings:\n"
+            "- 稀有鱼收藏：稀有及以上自动进入鱼缸流程；能写文件就保存到「我的鱼缸」；写入失败时给可复制鱼缸记录\n"
+            "- 画面参考：优先现实 / 气质网图参考\n"
+            "- report_style：story + status + next recommendation\n"
+            "\n"
+            "✅ 首次陪玩引导完成。现在可以开始钓鱼、潜水、买饵、换地点或进行其他推进动作。\n"
+            "注意：handshake defaults 只适合当前环境能直接提供网图参考时使用；如果不能发网图，应改用 handshake set ... visual=keywords。"
+        )
+    if sub == "set":
+        vals = dict(_HANDSHAKE_DEFAULTS)
+        aliases = {
+            "collection": "collection_mode", "collection_mode": "collection_mode",
+            "aquarium": "aquarium_save", "aquarium_save": "aquarium_save", "save": "aquarium_save",
+            "visual": "visual_mode", "visual_mode": "visual_mode",
+        }
+        allowed = {
+            "collection_mode": {"default", "default_card", "rare_plus_aquarium", "light", "card", "file", "custom"},
+            "aquarium_save": {"report", "card", "file", "folder_then_record", "ask"},
+            "visual_mode": {"web", "keywords", "generate", "text"},
+        }
+        bad = []
+        for token in args[1:]:
+            if "=" not in token:
+                bad.append(token); continue
+            k, v = token.split("=", 1)
+            k = aliases.get(k.strip().lower())
+            v = v.strip().lower()
+            if not k or v not in allowed[k]:
+                bad.append(token); continue
+            vals[k] = v
+        if bad:
+            return (
+                "🤝 handshake set 参数没读懂：%s\n"
+                "例：cmd('handshake set collection=rare_plus_aquarium aquarium=folder_then_record visual=keywords')\n"
+                "collection 可选 default/default_card/rare_plus_aquarium/light/card/file/custom；aquarium 可选 report/card/file/folder_then_record/ask；visual 可选 web/keywords/generate/text。"
+                % " ".join(bad)
+            )
+        hs.update(vals)
+        hs["completed"] = True
+        hs["confirmed_at_turn"] = S.get("turn", 0)
+        S["handshake"] = hs
+        return (
+            "本次陪玩配置档已生成：\n"
+            "play_settings:\n"
+            "- 稀有鱼收藏：%s\n"
+            "- 鱼缸保存：%s\n"
+            "- 画面参考：%s\n"
+            "- report_style：story + status + next recommendation\n"
+            "\n"
+            "✅ 首次陪玩引导完成。现在可以开始推进游戏。"
+            % (
+                _handshake_label("collection_mode", hs.get("collection_mode")),
+                _handshake_label("aquarium_save", hs.get("aquarium_save")),
+                _handshake_label("visual_mode", hs.get("visual_mode")),
+            )
+        )
+    return (
+        "🤝 未知 handshake 子指令。\n"
+        "可用：handshake status / handshake template / handshake defaults / handshake set collection=rare_plus_aquarium aquarium=folder_then_record visual=keywords / handshake reset"
+    )
+
+def _requires_handshake_block(c, args):
+    """返回是否应因未完成握手而阻止这条命令。"""
+    if _handshake_done():
+        return False
+    c = (c or "").lower()
+    if c in ("goto", "go") and not args:
+        return False   # 只列地点，不推进
+    if c in _HANDSHAKE_PROGRESS_CMDS:
+        return True
+    return False
+
+
+def _pending_collection_blocked_message(cmd_name):
+    pending = S.get("pending_collection") or []
+    names = "、".join([x.get("name", x.get("raw", "未命名")) for x in pending]) or "未命名"
+    return (
+        "⛔ 还有待确认入缸的收藏任务，已拦截指令：%s\n"
+        "待入缸：%s\n"
+        "\n"
+        "请先把这些鱼的记录落地，不能只口头说已收藏。\n"
+        "正式保存：在原游戏项目目录里的「我的鱼缸」子目录中创建 .md 记录。\n"
+        "Drive 稳定路线：不要优先 upload 本地 .md；优先在 Drive 中 create Google Doc → 写入 Markdown 正文 → 用 update_file/addParents 移到「我的鱼缸」文件夹。成功移动到目标文件夹后可视为 Drive 正式落地，但要说明它是 Google Doc，不是原生 .md。\n"
+        "Drive 兜底：如果不能指定父文件夹或移动父目录被拦，允许创建标题带【我的鱼缸】前缀的 Google Doc，例如【我的鱼缸】万瞳晶母。必须说明这是 Drive 兜底保存，可能尚未物理归位。\n"
+        "确认正式保存或 Drive 兜底保存已落地后，执行 cmd('collection saved') 或 cmd('__collection_saved__') 解除门禁。"
+        % (cmd_name, names)
+    )
+
+
 def _state_json():
     bait = {b: n for b, n in S["bait_inventory"].items() if n > 0}
     j = {"pts": S["points"], "loc": LOCATIONS[S["location_id"]]["name"], "sea": SEASONS[S["season_id"]]["name"],
@@ -1499,6 +1771,7 @@ def _state_json():
     if S.get("oxygen", 0) > 0: j["oxygen"] = S["oxygen"]         # 氧气瓶（dive 用）
     if S.get("fever", 0) > 0: j["fever"] = S["fever"]            # 剩余翻倍竿数
     if S.get("free_bait", 0) > 0: j["free_bait"] = S["free_bait"]  # 剩余免饵竿数
+    if S.get("pending_collection"): j["pending_collection"] = len(S.get("pending_collection") or [])
     lid = S["location_id"]   # 本地潜水点：未解锁则示意藏宝图碎片进度
     if not _dive_unlocked(lid):
         have = S.get("map_fragments", {}).get(lid, 0)
@@ -2061,13 +2334,16 @@ _HELP = """文字钓鱼游戏（你是玩家）。用点数买鱼饵→抛竿→
   cmd('encyclopedia')         看图鉴收集进度
   cmd('look <id或中文名>')     细看鱼/地点/鱼饵/季节/物品（如 cmd('look 月鳞鲤')；没钓到的鱼显示 ？？？）
   cmd('start')                新窗口/新模型接入检查：确认存档路径、README、收藏/视觉模式与战报要求
+  cmd('handshake')            首次陪玩引导门禁：status|template|defaults|set|reset；未完成前禁止 cast/dive/buy/goto/sell/open
   cmd('collection')           收藏缸设置/查看：collection default|off|custom <rarity>|status
   cmd('savecopy')             立刻保存一份时间戳备份：fishing_save_YYYYMMDD_HHMMSS.json，并重置导出提醒
   cmd('__exported__')         只标记“我已经把存档导出过了”，不另存备份
   cmd('A; B; C')              把多条指令用 ; 或换行串成一批、一次执行（最多 8 条），如 cmd('buy basic_worm 10; cast 10')、cmd('goto reed_river; cast 8 stop=new')
 抛竿偶尔会遇到漂流瓶/宝箱/宝物等惊喜事件；钓到鱼时也偶有幸运时刻（分裂鱼钩/渔获热潮/河神祝福…），可遇不可求。买氧气瓶后可在任意钓点 dive 潜水，捕获只有水下才有的鱼种（水面抛竿钓不到）。每次返回末尾都有一行 📊 状态栏 JSON（点数/地点/季节/回合/图鉴/余饵/未卖渔获；oxygen=氧气瓶、fever=剩余翻倍、free_bait=剩余免饵），看它就够、不必再单独 status。
 goto 清单会标出每个钓点当季还有几种没见过的鱼（含单列的传说级），照着去补图鉴。
-目标：用有限点数把图鉴里的鱼尽量集满（有的鱼只在特定地点+季节出现）。一开始你并不知道有哪些鱼——靠抛竿去发现。"""
+目标：用有限点数把图鉴里的鱼尽量集满（有的鱼只在特定地点+季节出现）。一开始你并不知道有哪些鱼——靠抛竿去发现。
+
+⚠️ 开局门禁：第一次开始陪玩时，必须先完成 First Play Onboarding。未完成前，游戏会拦截 cast/dive/buy/goto/sell/open 等推进动作。可用 cmd('handshake template') 取得必须使用的开局文案。玩家说“按默认来”后，若能直接发网图用 cmd('handshake defaults')；若不能发网图，用 cmd('handshake set collection=rare_plus_aquarium aquarium=folder_then_record visual=keywords')。"""
 
 def _drain_warn(out):
     """把待提示的存档读写问题贴到输出末尾，并清空（一次性）。保证任何返回都带上 IO 提示。"""
@@ -2083,20 +2359,41 @@ def _mark_exported():
     return "✅ 已标记：回合 %d 的存档视为已导出。" % S["last_export_turn"]
 
 def _savecopy():
-    """保存一份带日期时间的存档副本，适配不能覆盖文件、或需要手动带走存档的环境。"""
+    """保存一份带日期时间的存档副本，适配不能覆盖文件、或需要手动带走存档的环境。
+    兜底顺序：json → json.txt → md 包 json 代码块。鱼缸记录另行固定用 md。"""
     _save()
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     folder = os.path.dirname(_SAVE) or "."
-    name = "fishing_save_%s.json" % ts
-    dst = os.path.join(folder, name)
-    with open(_SAVE, "rb") as src, open(dst, "wb") as out:
-        out.write(src.read())
-    S["last_export_turn"] = S.get("turn", 0)
-    _save()
-    return "💾 已另存时间戳备份：%s。以后跨窗口/换环境时，优先读取最新的 fishing_save_*.json。" % name
+    payload = json.dumps(S, ensure_ascii=False, indent=2)
+    attempts = [
+        ("fishing_save_%s.json" % ts, payload),
+        ("fishing_save_%s.json.txt" % ts, payload),
+        ("fishing_save_backup_%s.md" % ts,
+         "# Fishing Save Backup\n\n"
+         "原始文件名：fishing_save.json\n"
+         "保存时间：%s\n"
+         "说明：这是存档 JSON 的兜底备份。恢复时，请复制下面代码块内容，另存为原项目目录下的 fishing_save.json。\n\n"
+         "```json\n%s\n```\n" % (datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), payload)),
+    ]
+    last_err = None
+    for name, text in attempts:
+        try:
+            dst = os.path.join(folder, name)
+            with open(dst, "w", encoding="utf-8") as out:
+                out.write(text)
+            S["last_export_turn"] = S.get("turn", 0)
+            _save()
+            if name.endswith(".json"):
+                return "💾 已另存时间戳备份：%s。以后跨窗口/换环境时，优先读取最新的 fishing_save_*.json。" % name
+            return ("💾 无法使用标准 .json 备份时，已改用兜底格式保存：%s。"
+                    "这不是主动存档文件；恢复时请把其中的 JSON 内容复制回原项目目录下的 fishing_save.json。" % name)
+        except Exception as e:
+            last_err = e
+    return ("⚠️ 存档备份失败：标准 .json、.json.txt、.md 兜底都没写入成功（%s）。"
+            "请把当前状态手动复制保存，或检查原项目目录/Drive 文件夹权限。" % last_err)
 
 def _c_start():
-    """新窗口/新模型接入检查：先确认读档，再确认 README/陪玩规则。"""
+    """新窗口/新模型接入检查：先确认读档，再确认 README/陪玩规则与首次陪玩引导。"""
     _load()
     here = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else os.getcwd()
     readme = os.path.join(here, "README.md")
@@ -2113,24 +2410,29 @@ def _c_start():
         else:
             collection = "已确认：关闭。"
     else:
-        collection = "未确认：请问人类是否 collection default / off / custom <rarity>。"
+        collection = "未确认：默认按稀有及以上提醒收藏；首次陪玩引导里用自然语言说明，不把 collection default/off/custom 当成用户表单。"
     return ("🎣 新窗口/新模型开局检查\n"
-            "\n建议接入顺序：cmd('start') → 读取 README.md → cmd('status') → 再继续玩。\n"
+            "\n建议接入顺序：cmd('start') → 读取 README.md → cmd('status') → cmd('collection status') → 判断视觉能力 → 使用自然开场说明稀有鱼收藏/鱼缸流程和画面参考 → 玩家确认 → cmd('handshake defaults' 或 handshake set ... visual=keywords) → 再继续玩。\n"
             "\n第一道门：先确认是读取旧档，不是重开。\n"
             "- 当前目录：%s\n"
             "- 主存档：%s\n"
             "- 主存档状态：%s\n"
             "- 最新时间戳备份：%s\n"
             "- 先跑 cmd('status') 看当前进度；除非人类明确要求，不要擅自 new_game。\n"
-            "\n第二道门：读取 README，加载陪玩规则。\n"
+            "\n第二道门：完成首次陪玩引导（未完成前 cast/dive/buy/goto/sell/open 会被拦截）。这不是设置表单，而是第一段陪玩 onboarding。\n"
+            "- 使用 cmd('handshake template') 的自然开场，不要把 收藏模式/入缸方式/视觉模式 作为空白表单丢给用户。\n"
+            "- 玩家回复「按默认来」后，若能直接发网图，执行 cmd('handshake defaults')；若不能直接发网图，执行 cmd('handshake set collection=rare_plus_aquarium aquarium=folder_then_record visual=keywords')。\n"
+            "- 玩家想改哪一项时，先用自然语言确认，再映射为 cmd('handshake set collection=... aquarium=... visual=...')。\n"
+            "- 当前握手状态：%s\n"
+            "\n第三道门：读取 README，加载陪玩规则。\n"
             "- README：%s\n"
             "- 新模型/新窗口如果不了解规则，应先问：要不要我读一遍 README 再继续？\n"
-            "- README 里包含：收藏模式、实际入缸方式、视觉模式、🎨 配图/生图兜底、每轮战报最低内容。\n"
+            "- README 里包含：文件定位、首次陪玩引导、稀有鱼收藏/鱼缸流程、视觉能力边界、🎨 配图/生图兜底、每轮战报最低内容。\n"
             "\n当前收藏设置：%s\n"
             "- 可再跑 cmd('collection status') 复核；如果是自定义门槛，按当前门槛执行。\n"
-            "- 注意：收藏提醒不等于已经写入鱼缸文件；实际入缸方式要问人类，是战报标记、收藏卡，还是文件入缸。\n"
+            "- 注意：收藏提醒不等于已经写入鱼缸文件；默认优先写入「我的鱼缸」，失败才给可复制鱼缸记录。\n"
             "\n最低战报要求：不能只发图，也不能只贴游戏原文；新鱼必须写名称、稀有度、尺寸/价值、核心描述、视觉参考说明、当前状态和下一步建议。"
-            % (here, _SAVE, "已找到 fishing_save.json，将读取旧档。" if os.path.exists(_SAVE) else "未找到 fishing_save.json，首次运行会开新档。", latest, readme, collection))
+            % (here, _SAVE, "已找到 fishing_save.json，将读取旧档。" if os.path.exists(_SAVE) else "未找到 fishing_save.json，首次运行会开新档。", latest, _handshake_status_text().replace("\n", " / "), readme, collection))
 
 _BATCH_MAX = 8
 def _run_one(line):
@@ -2139,6 +2441,11 @@ def _run_one(line):
     if not line: return _HELP
     parts = line.split()
     c = parts[0].lower(); a = parts[1:]
+    if _requires_handshake_block(c, a):
+        return _handshake_blocked_message(c)
+    pending = S.get("pending_collection") or []
+    if pending and c in _HANDSHAKE_PROGRESS_CMDS:
+        return _pending_collection_blocked_message(c)
     # 远征进行中（水下）：只允许 choose/surface + 只读指令，其余先按下
     if S.get("expedition") and c not in ("choose", "ch", "surface", "up", "status", "s", "inventory", "inv", "i", "encyclopedia", "enc", "e", "look", "l", "help", "h"):
         return "你还在水下远征中——先 choose <编号> 处理眼前的遗迹，或 surface 返航上岸。"
@@ -2146,6 +2453,8 @@ def _run_one(line):
         if c in ("__exported__", "exported", "mark_exported"): return _mark_exported()
         elif c in ("savecopy", "export", "backup") or line.lower() == "save copy": return _savecopy()
         elif c in ("start", "checkin", "check-in", "开局", "接入"): return _c_start()
+        elif c == "handshake": return _c_handshake(a)
+        elif c in ("__collection_saved__", "collection_saved", "mark_collection_saved"): return _c_collection(["saved"])
         elif c in ("help", "h"): return _HELP
         elif c in ("choose", "ch"):
             if a and a[0].lstrip("+").isdigit(): return _c_choose(int(a[0]))
@@ -2190,13 +2499,26 @@ _VISUAL_MARKERS = {
     "🖼️": "钓点/场景参考图",
 }
 
+def _catch_name_from_line(s):
+    t = s
+    for prefix in ("🆕", "✦✦", "✦", "👑", "✧"):
+        if t.startswith(prefix):
+            t = t[len(prefix):].strip()
+            break
+    return t.split("·", 1)[0].strip() or t[:30]
+
 def _catch_rarity_from_line(s):
-    """从一行渔获播报文字里认出这条鱼的稀有度 id，认不出返回 None。"""
+    """从一行渔获播报文字里认出这条鱼的稀有度 id，认不出返回 None。
+    注意：地点列表也可能用 ✦ 标记“当前地点”，不能只看行首符号；必须确认这行像渔获行。"""
     if s.startswith("🆕"):
         # 格式：🆕 名 · 稀有度标签 · 尺寸 · 点数
         bits = s.split("·")
         if len(bits) >= 2:
             return _RARITY_LABEL_TO_ID.get(bits[1].strip())
+        return None
+    # 非新种渔获通常带尺寸/点数分隔；地点列表、状态列表不应触发收藏判断。
+    looks_like_catch = ("·" in s and "点" in s and ("cm" in s or "kg" in s or "m" in s))
+    if not looks_like_catch:
         return None
     if s.startswith("✦✦"):
         return "epic"
@@ -2212,10 +2534,9 @@ def _onboarding_prompt():
     cfg = _load_collection_cfg()
     if cfg.get("configured"):
         return ""
-    return ("\n\n🏺 第一次玩：要不要开启「收藏缸」功能？默认方案是稀有及以上自动收藏。\n"
-             "  cmd('collection default')          用默认方案\n"
-             "  cmd('collection off')              不用收藏功能\n"
-             "  cmd('collection custom <rarity>')  自定义门槛（common/uncommon/rare/epic/legendary/mythic）")
+    return ("\n\n🏺 收藏缸还没设置过。首次陪玩引导里请用自然语言说明：默认会对稀有及以上启动鱼缸流程，能写文件就保存进「我的鱼缸」，写入失败时才给可复制鱼缸记录。\n"
+             "如果玩家说『按默认来』，可在确认后使用 collection default；如果玩家说不想收藏或想改门槛，再映射到 collection off/custom。\n"
+             "不要把 collection default/off/custom 当成开局表单直接丢给玩家。")
 
 def _visual_and_export_reminders(out):
     """扫本轮输出找有画面感的东西、判断是否该进收藏缸、检查存档导出是否过期。这段跟着 cmd() 每次
@@ -2237,15 +2558,32 @@ def _visual_and_export_reminders(out):
             lines.append("  - [新种（记得配图）] %s" % s)
         r = _catch_rarity_from_line(s)
         if r and _rarity_meets_threshold(r, cfg):
+            pending = S.setdefault("pending_collection", [])
+            key = s
+            if not any(x.get("raw") == key for x in pending):
+                pending.append({"name": _catch_name_from_line(s), "rarity": r, "raw": s, "turn": S.get("turn", 0)})
+                _save()
             lines.append("  - [该进收藏缸了：%s级] %s" % (RARITY[r]["label"], s))
     reminder = ""
     if lines:
         reminder += "\n\n🎨 本轮画面感/收藏时刻：\n" + "\n".join(lines)
+        has_collection = any("[该进收藏缸了" in x for x in lines)
+        has_visual = any("[该进收藏缸了" not in x for x in lines)
+        if has_collection:
+            reminder += "\nCOLLECTION_REQUIRED: true"
+            reminder += "\n🏺 鱼缸写入提示：正式保存是在原游戏项目目录的「我的鱼缸」子目录中创建 .md 记录。Drive 场景下不要优先 upload 本地 .md；稳定路线是 create Google Doc → 写入 Markdown 正文 → 用 update_file/addParents 移到「我的鱼缸」文件夹。成功移动到目标文件夹后可视为 Drive 正式落地，但要说明它是 Google Doc，不是原生 .md。如果不能指定父文件夹或移动被拦，允许创建标题带【我的鱼缸】前缀的 Google Doc 作为 Drive 兜底保存，并说明可能尚未物理归位。确认保存已落地后必须执行 cmd('collection saved') 或 cmd('__collection_saved__')，否则继续推进会被拦截。"
+        if has_visual:
+            reminder += "\nVISUAL_REQUIRED: true"
+        if has_collection or has_visual:
+            reminder += "\nPENDING_TASKS: " + ", ".join((["collection"] if has_collection else []) + (["visual"] if has_visual else []))
+            reminder += "\n✅ 并发处理规则：同一轮如果同时有收藏/存档/视觉任务，必须逐项完成；先处理鱼缸/存档写入，再补齐视觉参考，不能因为写鱼缸或存档就吃掉配图。"
     gap = S.get("turn", 0) - S.get("last_export_turn", 0)
     if gap >= _EXPORT_WARN_THRESHOLD:
         reminder += ("\n\n⚠️⚠️⚠️ 存档提醒：距上次标记导出已经 %d 回合"
-                     "（当前回合%s，上次导出标记时回合%s）——该往 Drive/本地文件夹存一份了！"
-                     "存完记得 cmd('__exported__') 更新标记。⚠️⚠️⚠️"
+                     "（当前回合%s，上次导出标记时回合%s）。存档要回到原游戏项目目录：本地项目就写回本地文件夹，Google Drive 项目就写回同一个 Drive 文件夹。"
+                     "如果本轮是在临时沙盒运行，沙盒里的 fishing_save.json / savecopy 只算临时中转，不算长期保存。"
+                     "主存档应优先恢复为 fishing_save.json；如果连接器不能写 .json，可先保存为 fishing_save.json.txt 或带 json 代码块的 fishing_save_backup.md，但这只是可恢复备份，不是活跃存档。"
+                     "确认已经写回原目录后，再用 cmd('__exported__') 更新标记。⚠️⚠️⚠️"
                      % (gap, S.get("turn", 0), S.get("last_export_turn", 0)))
     return reminder
 
@@ -2256,7 +2594,7 @@ def cmd(line=""):
     特殊指令 savecopy/export/backup：保存一份 fishing_save_YYYYMMDD_HHMMSS.json，并重置导出提醒。"""
     _load()
     raw = (line or "").strip()
-    _INFO_ONLY_CMDS = {"status", "start", "checkin", "check-in", "开局", "接入", "help", "h", "?", "shop", "encyclopedia", "enc", "e",
+    _INFO_ONLY_CMDS = {"status", "start", "checkin", "check-in", "开局", "接入", "handshake", "help", "h", "?", "shop", "encyclopedia", "enc", "e",
                         "inventory", "inv", "i", "look", "l", ""}
     if not raw:
         out0 = _HELP
@@ -2278,4 +2616,4 @@ def new_game(seed=_DEFAULT_SEED):
     """重开一局（可指定种子，同种子+同指令完全可复现）。"""
     global S
     S = _new_state(seed); _save()
-    return "已重开新局（种子 %d）。调 cmd('help') 看规则，cmd('cast') 开钓。" % S["seed"]
+    return "已重开新局（种子 %d）。调 cmd('help') 看规则。注意：开始钓鱼前必须先走 cmd('handshake template') 的首次陪玩引导；玩家确认后再执行 handshake defaults 或 handshake set。未完成前 cast/dive/buy 会被拦截。" % S["seed"]
