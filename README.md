@@ -12,6 +12,57 @@ AI 必须分清楚：什么是游戏引擎真实结果，什么是 AI 叙事补�
 
 ---
 
+## 快速开始 / Quick Start
+
+### 方式一：在 ChatGPT / Claude 等 AI 聊天窗口里玩
+
+1. 下载或复制本仓库文件。
+2. 把整个项目文件夹交给 AI，或至少上传 / 挂载这些文件：
+   - `README.md`
+   - `fishing.py`
+   - `fishing_save.json`（如果有旧存档）
+   - `collection_config.json`（如果有收藏设置）
+   - `我的鱼缸/`（如果要保留稀有鱼收藏）
+3. 对 AI 说：
+
+```text
+请先阅读 README.md，找到 fishing.py，然后按照首次陪玩引导开始。不要直接开钓。
+```
+
+AI 应先完成 onboarding，读取状态和收藏设置，等你确认“按默认来”以后再开始。
+
+### 方式二：在本地 Python 里运行
+
+本项目不需要额外依赖，Python 3 即可。
+
+```bash
+python3 - <<'PY'
+import fishing
+print(fishing.cmd("status"))
+PY
+```
+
+常用命令示例：
+
+```python
+import fishing
+
+print(fishing.cmd("handshake template"))
+print(fishing.cmd("handshake defaults"))
+print(fishing.cmd("shop"))
+print(fishing.cmd("buy basic_worm 5"))
+print(fishing.cmd("cast 5 stop=rare"))
+print(fishing.cmd("sell all"))
+```
+
+如果修改了 `engine.py`，需要重新生成盲盒入口：
+
+```bash
+python3 build_blind.py
+```
+
+---
+
 ## File Discovery Rule / 文件定位规则
 
 If AI can see the project folder or `README.md` but cannot find `fishing.py`, `engine.py`, or other runtime files, AI must not immediately conclude that the files are missing.
